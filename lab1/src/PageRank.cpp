@@ -1,13 +1,16 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -18,11 +21,71 @@ constexpr double kTolerance = 1e-12;
 constexpr int kMaxIterations = 1000;
 constexpr int kTopK = 100;
 constexpr int kBlockSize = 1024;
+constexpr int kInvalidIndex = -1;
+constexpr std::size_t kMaxOpenWriters = 128;
+
+struct EdgeRecord {
+    int source = 0;
+    int target_local = 0;
+};
+
+struct BlockFile {
+    int begin = 0;
+    int end = 0;
+    std::int64_t edge_count = 0;
+    std::filesystem::path path;
+};
+
+struct TempDirectory {
+    std::filesystem::path path;
+
+    TempDirectory() = default;
+    explicit TempDirectory(std::filesystem::path value) : path(std::move(value)) {}
+
+    TempDirectory(const TempDirectory&) = delete;
+    TempDirectory& operator=(const TempDirectory&) = delete;
+
+    TempDirectory(TempDirectory&& other) noexcept : path(std::move(other.path)) {
+        other.path.clear();
+    }
+
+    TempDirectory& operator=(TempDirectory&& other) noexcept {
+        if (this != &other) {
+            Cleanup();
+            path = std::move(other.path);
+            other.path.clear();
+        }
+        return *this;
+    }
+
+    ~TempDirectory() {
+        Cleanup();
+    }
+
+    void Cleanup() noexcept {
+        if (path.empty()) {
+            return;
+        }
+        std::error_code error;
+        std::filesystem::remove_all(path, error);
+        path.clear();
+    }
+};
 
 struct Graph {
     std::vector<std::int64_t> node_ids;
-    std::vector<int> row_ptr;
-    std::vector<int> col_idx;
+    std::vector<int> out_degree;
+    std::vector<double> inverse_out_degree;
+    std::vector<int> dead_nodes;
+    std::vector<BlockFile> blocks;
+    TempDirectory temp_dir;
+    std::int64_t edge_count = 0;
+};
+
+struct OpenWriter {
+    std::size_t block_index = 0;
+    std::uint64_t tick = 0;
+    std::ofstream stream;
 };
 
 std::ifstream OpenInputFile(const std::string& path) {
@@ -33,63 +96,144 @@ std::ifstream OpenInputFile(const std::string& path) {
     return input;
 }
 
+TempDirectory MakeTempDirectory() {
+    const auto timestamp =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    const std::filesystem::path path =
+        std::filesystem::current_path() / (".pagerank_block_cache_" + std::to_string(timestamp));
+    std::filesystem::create_directories(path);
+    return TempDirectory(path);
+}
+
+std::ofstream& AcquireWriter(std::vector<OpenWriter>& writers,
+                             const std::vector<BlockFile>& blocks,
+                             std::size_t block_index,
+                             std::uint64_t tick) {
+    for (OpenWriter& writer : writers) {
+        if (writer.block_index == block_index) {
+            writer.tick = tick;
+            return writer.stream;
+        }
+    }
+
+    if (writers.size() < std::min(kMaxOpenWriters, blocks.size())) {
+        writers.push_back(OpenWriter{});
+        OpenWriter& writer = writers.back();
+        writer.block_index = block_index;
+        writer.tick = tick;
+        writer.stream.open(blocks[block_index].path, std::ios::binary | std::ios::app);
+        if (!writer.stream) {
+            throw std::runtime_error("failed to open block file: " + blocks[block_index].path.string());
+        }
+        return writer.stream;
+    }
+
+    std::size_t victim = 0;
+    for (std::size_t i = 1; i < writers.size(); ++i) {
+        if (writers[i].tick < writers[victim].tick) {
+            victim = i;
+        }
+    }
+
+    OpenWriter& writer = writers[victim];
+    writer.stream.close();
+    writer.block_index = block_index;
+    writer.tick = tick;
+    writer.stream.open(blocks[block_index].path, std::ios::binary | std::ios::app);
+    if (!writer.stream) {
+        throw std::runtime_error("failed to open block file: " + blocks[block_index].path.string());
+    }
+    return writer.stream;
+}
+
 Graph ReadGraph(const std::string& input_path) {
     std::ifstream input = OpenInputFile(input_path);
 
-    std::vector<std::pair<std::int64_t, std::int64_t>> raw_edges;
-    std::vector<std::int64_t> raw_nodes;
-    raw_edges.reserve(200000);
-    raw_nodes.reserve(400000);
-
     std::int64_t from = 0;
     std::int64_t to = 0;
+    std::int64_t edge_count = 0;
+    std::int64_t max_node_id = 0;
     while (input >> from >> to) {
-        raw_edges.emplace_back(from, to);
-        raw_nodes.push_back(from);
-        raw_nodes.push_back(to);
+        max_node_id = std::max(max_node_id, std::max(from, to));
+        ++edge_count;
     }
 
-    if (raw_edges.empty()) {
+    if (edge_count == 0) {
         throw std::runtime_error("input graph is empty");
     }
 
-    std::sort(raw_nodes.begin(), raw_nodes.end());
-    raw_nodes.erase(std::unique(raw_nodes.begin(), raw_nodes.end()), raw_nodes.end());
-
-    std::unordered_map<std::int64_t, int> id_to_index;
-    id_to_index.reserve(raw_nodes.size() * 2);
-    for (int i = 0; i < static_cast<int>(raw_nodes.size()); ++i) {
-        id_to_index.emplace(raw_nodes[i], i);
+    std::vector<std::uint8_t> seen(static_cast<std::size_t>(max_node_id) + 1, 0);
+    input = OpenInputFile(input_path);
+    while (input >> from >> to) {
+        seen[static_cast<std::size_t>(from)] = 1;
+        seen[static_cast<std::size_t>(to)] = 1;
     }
 
-    std::vector<std::pair<int, int>> edges;
-    edges.reserve(raw_edges.size());
-    for (const auto& edge : raw_edges) {
-        edges.emplace_back(id_to_index.at(edge.first), id_to_index.at(edge.second));
+    std::vector<std::int64_t> node_ids;
+    std::vector<int> id_to_index(static_cast<std::size_t>(max_node_id) + 1, kInvalidIndex);
+    for (std::int64_t raw_id = 0; raw_id <= max_node_id; ++raw_id) {
+        if (seen[static_cast<std::size_t>(raw_id)] == 0) {
+            continue;
+        }
+        const int index = static_cast<int>(node_ids.size());
+        id_to_index[static_cast<std::size_t>(raw_id)] = index;
+        node_ids.push_back(raw_id);
     }
-    raw_edges.clear();
-    raw_edges.shrink_to_fit();
 
-    std::sort(edges.begin(), edges.end());
-    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-
-    const int n = static_cast<int>(raw_nodes.size());
+    const int n = static_cast<int>(node_ids.size());
     std::vector<int> out_degree(n, 0);
-    for (const auto& edge : edges) {
-        ++out_degree[edge.first];
+    input = OpenInputFile(input_path);
+    while (input >> from >> to) {
+        ++out_degree[id_to_index[static_cast<std::size_t>(from)]];
     }
 
     Graph graph;
-    graph.node_ids = std::move(raw_nodes);
-    graph.row_ptr.assign(n + 1, 0);
+    graph.node_ids = std::move(node_ids);
+    graph.out_degree = std::move(out_degree);
+    graph.inverse_out_degree.assign(n, 0.0);
     for (int i = 0; i < n; ++i) {
-        graph.row_ptr[i + 1] = graph.row_ptr[i] + out_degree[i];
+        if (graph.out_degree[i] == 0) {
+            graph.dead_nodes.push_back(i);
+        } else {
+            graph.inverse_out_degree[i] = 1.0 / static_cast<double>(graph.out_degree[i]);
+        }
+    }
+    graph.edge_count = edge_count;
+    graph.temp_dir = MakeTempDirectory();
+
+    for (int begin = 0; begin < n; begin += kBlockSize) {
+        BlockFile block;
+        block.begin = begin;
+        block.end = std::min(begin + kBlockSize, n);
+        block.path = graph.temp_dir.path / ("block_" + std::to_string(graph.blocks.size()) + ".bin");
+        graph.blocks.push_back(std::move(block));
     }
 
-    graph.col_idx.assign(edges.size(), 0);
-    std::vector<int> cursor = graph.row_ptr;
-    for (const auto& edge : edges) {
-        graph.col_idx[cursor[edge.first]++] = edge.second;
+    for (const BlockFile& block : graph.blocks) {
+        std::ofstream output(block.path, std::ios::binary | std::ios::trunc);
+        if (!output) {
+            throw std::runtime_error("failed to create block file: " + block.path.string());
+        }
+    }
+
+    std::vector<OpenWriter> writers;
+    writers.reserve(std::min(kMaxOpenWriters, graph.blocks.size()));
+    std::uint64_t tick = 0;
+    input = OpenInputFile(input_path);
+    while (input >> from >> to) {
+        const int source = id_to_index[static_cast<std::size_t>(from)];
+        const int target = id_to_index[static_cast<std::size_t>(to)];
+        const std::size_t block_index =
+            std::min<std::size_t>(target / kBlockSize, graph.blocks.size() - 1);
+        const EdgeRecord record{source, target - graph.blocks[block_index].begin};
+        std::ofstream& writer = AcquireWriter(writers, graph.blocks, block_index, ++tick);
+        writer.write(reinterpret_cast<const char*>(&record), sizeof(record));
+        if (!writer) {
+            throw std::runtime_error("failed to write block file: " + graph.blocks[block_index].path.string());
+        }
+        ++graph.blocks[block_index].edge_count;
     }
 
     return graph;
@@ -102,50 +246,79 @@ std::vector<double> ComputePageRank(const Graph& graph, int* iterations, double*
 
     std::vector<double> rank(n, initial_rank);
     std::vector<double> next_rank(n, 0.0);
+    std::vector<EdgeRecord> buffer(65536);
+    std::vector<double> block_accumulator(kBlockSize, 0.0);
+    std::vector<std::ifstream> block_inputs;
+    if (graph.blocks.size() <= kMaxOpenWriters) {
+        block_inputs.resize(graph.blocks.size());
+        for (std::size_t i = 0; i < graph.blocks.size(); ++i) {
+            block_inputs[i].open(graph.blocks[i].path, std::ios::binary);
+            if (!block_inputs[i]) {
+                throw std::runtime_error("failed to open block file: " + graph.blocks[i].path.string());
+            }
+        }
+    }
 
     double diff = 0.0;
     int iter = 0;
     for (iter = 1; iter <= kMaxIterations; ++iter) {
         double dead_rank_sum = 0.0;
-        for (int i = 0; i < n; ++i) {
-            if (graph.row_ptr[i] == graph.row_ptr[i + 1]) {
-                dead_rank_sum += rank[i];
-            }
+        for (const int node : graph.dead_nodes) {
+            dead_rank_sum += rank[node];
         }
 
         const double dead_contribution =
             kDampingFactor * dead_rank_sum / static_cast<double>(n);
-        std::fill(next_rank.begin(), next_rank.end(), base_rank + dead_contribution);
-
-        for (int block_start = 0; block_start < n; block_start += kBlockSize) {
-            const int block_end = std::min(block_start + kBlockSize, n);
-            for (int src = block_start; src < block_end; ++src) {
-                const int begin = graph.row_ptr[src];
-                const int end = graph.row_ptr[src + 1];
-                const int degree = end - begin;
-                if (degree == 0) {
-                    continue;
-                }
-
-                const double contribution =
-                    kDampingFactor * rank[src] / static_cast<double>(degree);
-                for (int edge = begin; edge < end; ++edge) {
-                    next_rank[graph.col_idx[edge]] += contribution;
-                }
-            }
-        }
-
-        const double total_rank =
-            std::accumulate(next_rank.begin(), next_rank.end(), 0.0);
-        if (total_rank > 0.0) {
-            for (double& value : next_rank) {
-                value /= total_rank;
-            }
-        }
+        const double base_score = base_rank + dead_contribution;
 
         diff = 0.0;
-        for (int i = 0; i < n; ++i) {
-            diff += std::abs(next_rank[i] - rank[i]);
+        for (std::size_t block_index = 0; block_index < graph.blocks.size(); ++block_index) {
+            const BlockFile& block = graph.blocks[block_index];
+            const int block_length = block.end - block.begin;
+            std::fill(block_accumulator.begin(),
+                      block_accumulator.begin() + block_length,
+                      0.0);
+
+            std::ifstream temporary_input;
+            std::istream* block_input = nullptr;
+            if (!block_inputs.empty()) {
+                block_inputs[block_index].clear();
+                block_inputs[block_index].seekg(0, std::ios::beg);
+                block_input = &block_inputs[block_index];
+            } else {
+                temporary_input.open(block.path, std::ios::binary);
+                if (!temporary_input) {
+                    throw std::runtime_error("failed to open block file: " + block.path.string());
+                }
+                block_input = &temporary_input;
+            }
+
+            while (true) {
+                block_input->read(reinterpret_cast<char*>(buffer.data()),
+                                  static_cast<std::streamsize>(buffer.size() * sizeof(EdgeRecord)));
+                const std::streamsize bytes_read = block_input->gcount();
+                const std::size_t record_count =
+                    static_cast<std::size_t>(bytes_read / static_cast<std::streamsize>(sizeof(EdgeRecord)));
+
+                for (std::size_t i = 0; i < record_count; ++i) {
+                    const EdgeRecord& edge = buffer[i];
+                    block_accumulator[edge.target_local] +=
+                        rank[edge.source] * graph.inverse_out_degree[edge.source];
+                }
+
+                if (!(*block_input)) {
+                    if (block_input->eof()) {
+                        break;
+                    }
+                    throw std::runtime_error("failed to read block file: " + block.path.string());
+                }
+            }
+
+            for (int local = 0; local < block_length; ++local) {
+                const int node = block.begin + local;
+                next_rank[node] = base_score + kDampingFactor * block_accumulator[local];
+                diff += std::abs(next_rank[node] - rank[node]);
+            }
         }
 
         rank.swap(next_rank);
@@ -159,6 +332,12 @@ std::vector<double> ComputePageRank(const Graph& graph, int* iterations, double*
     }
     if (residual != nullptr) {
         *residual = diff;
+    }
+    const double total_rank = std::accumulate(rank.begin(), rank.end(), 0.0);
+    if (total_rank > 0.0) {
+        for (double& value : rank) {
+            value /= total_rank;
+        }
     }
     return rank;
 }
@@ -203,7 +382,7 @@ int main(int argc, char* argv[]) {
         WriteTopRanks(output_path, graph, rank);
 
         std::cerr << "nodes: " << graph.node_ids.size()
-                  << ", edges: " << graph.col_idx.size()
+                  << ", edges: " << graph.edge_count
                   << ", iterations: " << iterations
                   << ", residual: " << std::scientific << residual << '\n';
     } catch (const std::exception& error) {
