@@ -1,4 +1,6 @@
 *.zip
+*.npy
+*.bin
 __pycache__/
 .DS_Store
 *.aux
