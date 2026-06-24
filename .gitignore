@@ -8,3 +8,6 @@ __pycache__/
 *.out
 *.toc
 *.xdv
+
+# 外部公开数据集（本地实验用，不纳入版本管理）
+official_datasets/
