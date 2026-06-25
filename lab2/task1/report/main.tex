@@ -534,6 +534,34 @@ Metrics     -> result/metrics.json
 Total time: 71.29s
 \end{lstlisting}
 
+\subsection{运行效率：训练时间与空间消耗}
+
+本节从时间与空间两个维度刻画模型的资源开销，所有数据均在单线程 CPU 上实测，运行环境同上。
+
+\textbf{训练时间.} 完整流程（Phase~1 早停搜索 54 轮 $+$ Phase~2 在全部数据上重训 54 轮）端到端耗时约 $71.3$\,s（多次运行稳定在 $70.6$--$71.3$\,s）。耗时主体为 SGD 内层循环：每一轮需遍历全部 $N$ 条评分，对每条评分各更新一个用户隐向量、一个物品隐向量与两个偏置，单轮计算量为 $O(NF)$，总训练时间为 $O(E\,N\,F)$，其中 $E$ 为实际训练轮数、$F$ 为隐维度。
+
+\textbf{空间消耗.} 模型参数的空间复杂度为 $O\big((m+n)F\big)$，其中 $m{=}598$ 为用户数、$n{=}9077$ 为物品数、$F{=}100$ 为隐维度。以 \texttt{float64} 存储，各部分占用如表~\ref{tab:space}。
+
+\begin{table}[H]
+  \centering
+  \caption{模型参数的空间占用（\texttt{float64}，$8$ 字节/参数）}
+  \label{tab:space}
+  \begin{tabular}{l c r r}
+    \toprule
+    \textbf{参数} & \textbf{形状} & \textbf{参数量} & \textbf{占用} \\
+    \midrule
+    $P$\ \ 用户隐矩阵 & $m\times F=598\times100$   & 59{,}800  & 0.46\,MB \\
+    $Q$\ \ 物品隐矩阵 & $n\times F=9077\times100$  & 907{,}700 & 6.93\,MB \\
+    $\mathbf{b}_u$\ \ 用户偏置 & $m=598$            & 598       & 4.7\,KB \\
+    $\mathbf{b}_i$\ \ 物品偏置 & $n=9077$           & 9{,}077   & 70.9\,KB \\
+    \midrule
+    \textbf{合计} & — & \textbf{977{,}175} & \textbf{7.46\,MB} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+由于物品数远多于用户数（$n/m\approx15$），物品隐矩阵 $Q$ 占据约 $93\%$ 的参数空间，是空间开销的主导项；若需进一步压缩，降低 $F$ 或对长尾物品做共享/截断比裁剪用户侧更有效。训练阶段为支持早停的最优检查点回滚，会额外保存一份 $\{P,Q,\mathbf b_u,\mathbf b_i\}$ 的副本，使参数峰值约翻倍至 $15$\,MB；叠加评分列表与索引结构后，进程实测峰值常驻内存（RSS）为 $\mathbf{87.7}$\,MB，其中 Python 解释器与 NumPy 运行时基线约占 $70$\,MB，模型与训练数据结构本身仅约 $15$--$18$\,MB。综合来看，本方法在 RMSE（验证集 $17.02$）、训练时间（$71.3$\,s）与空间占用（模型 $7.46$\,MB、峰值 RSS $87.7$\,MB）三方面均处于轻量水平，可在任意普通笔记本上复现。
+
 \subsection{预测分布分析}
 
 \begin{figure}[H]
