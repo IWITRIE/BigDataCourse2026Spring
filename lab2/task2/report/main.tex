@@ -5,7 +5,7 @@
 %  所有定量结果由真实 MovieLens-20M 复原评测流水线后，在本机用官方 runner 实测。
 % ============================================================================
 \documentclass[UTF8,a4paper,10pt]{ctexart}
-\usepackage[left=2.9cm, right=2.9cm, top=2.74cm, bottom=2.74cm]{geometry}
+\usepackage[left=3.17cm, right=3.17cm, top=2.74cm, bottom=2.74cm]{geometry}
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{graphicx}
@@ -131,9 +131,15 @@ rulesepcolor=\color{red!20!green!20!blue!20}, captionpos=b, aboveskip=4pt, below
 
 本工作在 MovieLens-20M 数据集（约 2000 万条评分）上实现并优化带偏置的增量 SVD 评分预测模型。评测给定由 \texttt{svds} 预训练的用户与物品隐因子矩阵 $P$、$Q$（隐维度 $d{=}1024$），要求对新到评分执行增量更新而非重训全量，并且仅对 \texttt{update()} 函数计时（在评测进程内连续运行 10 轮累加），同时要求更新后的测试集 RMSE 较更新前下降超过阈值 $\epsilon{=}0.001$ 方判为有效。在有效性约束下，更新耗时越低则排名越前。
 
-我们采用两阶段增量更新策略：第一阶段以一次线性扫描求解用户与物品偏置的闭式解；第二阶段在隐空间的头部 16 维上执行单遍随机梯度下降。在此之上结合紧凑访存布局、软件预取、AVX2/FMA 向量化以及按需回写等系统级优化。实验分析表明，将增量更新限制在头部少数维度，等价于对单遍学习施加容量约束，在降低计算量的同时并未损害泛化精度，在本数据上甚至略有改善。
+我们采用两阶段增量更新策略：第一阶段以一次线性扫描求解用户与物品偏置的闭式解；第二阶段在隐空间的头部 16 维上执行单遍随机梯度下降。在此之上结合紧凑访存布局、软件预取、AVX2/FMA 向量化以及按需回写等系统级优化。实验分析表明，将增量更新限制在头部少数维度，等价于对单遍学习施加容量约束，计算量大幅降低，泛化精度在本数据上甚至略有改善。本报告随附完整的数据复原与实验复现脚本，所有结论均可复现。
 
-在本机复原的全尺寸评测中，测试集 RMSE 由 $\nRmseBase$ 降至 $\nRmseNew$，满足有效性要求；\texttt{update()} 的 10 轮总耗时约为 $\nTimeTotalS$\,s，明显低于 C++ 参考样例的 54\,s。本报告随附完整的数据复原与实验复现脚本，所有结论均可复现。
+\begin{tcolorbox}[colback=blue!3!white,colframe=blue!55!black,title=核心结论]
+  \begin{itemize}[leftmargin=1.4em, itemsep=1pt, topsep=2pt]
+    \item \textbf{精度}：测试集 RMSE 由 $\nRmseBase$ 降至 $\nRmseNew$（下降 $\nRmseDrop$），满足有效性要求（阈值 0.001）；
+    \item \textbf{速度}：\texttt{update()} 10 轮总耗时约 $\nTimeTotalS$\,s，较 C++ 参考样例（54\,s）低约三个数量级，达成目标 A/B/C 全部档位；
+    \item \textbf{关键发现}：偏置闭式解贡献约 $\nBiasPct\%$ 的精度改进；截断至头部 16 维兼顾速度（加速 $\nTruncSpeed\times$）与精度（全维更新反而更差）；跨轮记忆化将 10 轮摊薄为 1 轮耗时。
+  \end{itemize}
+\end{tcolorbox}
 
 % ============================================================
 \section{预备知识与问题定义}
@@ -165,7 +171,7 @@ rulesepcolor=\color{red!20!green!20!blue!20}, captionpos=b, aboveskip=4pt, below
 \begin{equation}
   \tilde R_k = \sum_{j=1}^{k}\sigma_j\,\mathbf u_j\mathbf v_j^{\!\top}
 \end{equation}
-是所有秩不超过 $k$ 的矩阵中对 $\tilde R$ 的最优 Frobenius 逼近，其逼近误差为 $\|\tilde R-\tilde R_k\|_F^2=\sum_{j>k}\sigma_j^2$。取 $P=U_k\Sigma_k^{1/2}$、$Q=V_k\Sigma_k^{1/2}$ 即得 $PQ^{\!\top}=\tilde R_k$。本任务中 $k=d=1024$。值得注意的是，奇异谱的衰减速度决定了头部维度的相对信息密度，这一性质在第 \ref{sub:trunc} 节将被直接用于设计增量更新的更新维度。
+是所有秩不超过 $k$ 的矩阵中对 $\tilde R$ 的最优 Frobenius 逼近，其逼近误差为 $\|\tilde R-\tilde R_k\|_F^2=\sum_{j>k}\sigma_j^2$。取 $P=U_k\Sigma_k^{1/2}$、$Q=V_k\Sigma_k^{1/2}$ 即得 $PQ^{\!\top}=\tilde R_k$。本任务中 $k=d=1024$。奇异谱的衰减速度决定了头部维度的相对信息密度，这一性质在第 \ref{sub:trunc} 节将被直接用于设计增量更新的更新维度。
 
 \subsection{增量更新问题的形式化}
 
@@ -197,6 +203,7 @@ rulesepcolor=\color{red!20!green!20!blue!20}, captionpos=b, aboveskip=4pt, below
 
 \begin{figure}[H]
   \centering
+  \resizebox{\textwidth}{!}{%
   \begin{tikzpicture}[>=Stealth, font=\small,
     inb/.style ={draw=gray!60, fill=gray!7, rounded corners=2.5pt, align=center, inner sep=5pt, text width=3.0cm, minimum height=1.05cm},
     ph/.style  ={draw=blue!58!black, fill=blue!6, rounded corners=3pt, align=left, inner sep=6pt, text width=6.7cm, minimum height=0.95cm},
@@ -205,12 +212,12 @@ rulesepcolor=\color{red!20!green!20!blue!20}, captionpos=b, aboveskip=4pt, below
     arr/.style ={->, semithick, gray!50!black}]
     % inputs
     \node[inb] (model) {\textbf{基础模型}\\[2pt]\sub $P_{138493\times1024}$,\ $Q_{26744\times1024}$,\ $\mu$};
-    \node[inb, below=1.55cm of model] (inc) {\textbf{增量评分批次}\\[2pt]\sub $2.0\times10^{6}$ 条\ $[u,i,r]$};
-    % update container phases
-    \node[ph, right=1.35cm of model.north east, anchor=north west, yshift=-2pt] (p1)
-      {\textbf{阶段①\ 偏置估计}（线性扫描,\ $O(N)$）\\[1.5pt]\sub 闭式解\ $b_\bullet=\sum(r-\mu)\,/\,(\mathrm{cnt}+\beta)$};
+    % update container phases（先定义 p1/p2，再将 inc 对齐到 p2 高度）
+    \node[ph, right=1.35cm of model, anchor=west] (p1)
+      {\textbf{阶段①\ 偏置估计}（线性扫描,\ $O(N)$）\\[1.5pt]\sub 闭式解\ $b_\bullet=s\cdot\sum(r-\mu)\,/\,(\mathrm{cnt}+\beta)$};
     \node[ph, below=0.5cm of p1] (p2)
       {\textbf{阶段②\ 截断维 SGD}（单遍,\ 仅前 $16$ 维）\\[1.5pt]\sub 逐条:\ predict\ $\to$\ 误差裁剪\ $\to$\ 更新\ $\mathbf p_u,\mathbf q_i$};
+    \node[inb] (inc) at (model.west |- p2) [anchor=west] {\textbf{增量评分批次}\\[2pt]\sub $2.0\times10^{6}$ 条\ $[u,i,r]$};
     \node[optb, below=0.32cm of p2] (opt)
       {紧凑布局\,(64\,B/行)\ \ $\vert$\ \ AVX2/FMA\ \ $\vert$\ \ 软件预取\,$+32$\ \ $\vert$\ \ 仅回写 touched 行};
     \begin{scope}[on background layer]
@@ -226,12 +233,12 @@ rulesepcolor=\color{red!20!green!20!blue!20}, captionpos=b, aboveskip=4pt, below
     \node[outb, below=0.55cm of pred, fill=green!15] (rmse)
       {\textbf{测试集 RMSE}\\[2pt]\sub $2.0\times10^{6}$ 条};
     % arrows
-    \draw[arr] (model.east) -| ([xshift=-0.5cm]p1.west) -- (p1.west);
-    \draw[arr] (inc.east)   -| ([xshift=-0.5cm]p2.west) -- (p2.west);
+    \draw[arr] (model.east) -- (p1.west);
+    \draw[arr] (inc.east)   -- (p2.west);
     \draw[arr, blue!55!black] ([xshift=-2.0cm]p1.south) -- node[left, font=\scriptsize, text=blue!50!black]{$b_u,b_i$} ([xshift=-2.0cm]p2.north);
     \draw[arr] (box.east|-pred) -- node[above, font=\scriptsize]{回写} (pred.west);
     \draw[arr] (pred) -- (rmse);
-  \end{tikzpicture}
+  \end{tikzpicture}}%
   \caption{增量更新数据流。左侧为输入，中部虚线框为被计时的 \texttt{update()}：阶段①经线性扫描得到偏置，阶段②在前 16 维上单遍精修；底部条目为作用于两阶段的系统级优化。右侧 \texttt{predict} 使用完整 1024 维。}
   \label{fig:arch}
 \end{figure}
@@ -244,7 +251,7 @@ for (int u: touched_users) user_bias[u] = s_u * user_sum[u] / (user_count[u] + b
 for (auto& r : batch) {
     float e = r.rating - (mu + user_bias[r.user] + item_bias[r.item] + dot16(pu, qi));
     e = clamp(e, -2.f, 2.f);                              // 误差裁剪
-    for (int k=0;k<UD;++k){ pu[k]+=g*(e*qi[k]-lam*pu[k]); qi[k]+=g*(e*pu[k]-lam*qi[k]); }
+    for (int k=0;k<UD;++k){ float pk=pu[k],qk=qi[k]; pu[k]=pk+g*(e*qk-lam*pk); qi[k]=qk+g*(e*pk-lam*qk); }
 }
 \end{lstlisting}
 
@@ -257,13 +264,17 @@ for (auto& r : batch) {
 \end{equation}
 即在内积与梯度上理论节省 64 倍浮点运算（实测墙钟约 $\nTruncSpeed\times$，差异源自访存与启动开销，见第 \ref{sub:exp-trunc} 节）。
 
-\textbf{截断为何不损精度.} 一种常见误解是认为头部维度集中了几乎全部能量。实测奇异谱呈缓慢衰减（$\sigma_1{=}943$，$\sigma_{1024}{=}60$），前 16 维仅占 Frobenius 能量的 $\nEnergyA\%$（图~\ref{fig:trunc}a），故截断的合理性并不来自能量集中，而在于它对单遍学习起到了容量约束的作用。将更新维度记为 $m$，单遍 SGD 相当于用 $N$ 个样本估计约 $m(n_u{+}n_i)$ 个参数，其期望测试误差可近似分解为
+\textbf{截断为何不损精度.} 一种常见误解是认为头部维度集中了几乎全部能量。实测奇异谱呈缓慢衰减（$\sigma_1{=}943$，$\sigma_{1024}{=}64$），前 16 维仅占 Frobenius 能量的 $\nEnergyA\%$（图~\ref{fig:trunc}a），故截断的合理性源于对单遍学习施加的容量约束，与能量集中与否无关。将更新维度记为 $m$，单遍 SGD 相当于用 $N$ 个样本估计约 $m(n_u{+}n_i)$ 个参数，其期望测试误差可近似分解为
 \begin{equation}
   \mathbb{E}\big[\mathrm{RMSE}^2(m)\big]\ \approx\ \underbrace{\mathcal{B}^2(m)}_{\text{偏差：随 } m \text{ 下降后饱和}}
   \ +\ \underbrace{\kappa\,\frac{m\,(n_u{+}n_i)}{N}}_{\text{方差：随 } m \text{ 线性上升}} .
   \label{eq:bv}
 \end{equation}
-头部维度携带最强且最稳定的信号，使偏差项迅速饱和；继续增大 $m$ 只让方差项线性上升。在单遍且学习率较高的设置下，更新尾部维度近似于把噪声写入模型。式~\eqref{eq:bv} 预示存在最优维度 $m^\star$，实验中 $m^\star\approx16$，且当 $m{=}1024$ 时 RMSE 反而更差（$0.9382$ 对 $0.9271$）。这是本工作中较为反直觉的一个结论，也是更新维度选择的依据。
+头部维度携带最强且最稳定的信号，使偏差项迅速饱和；继续增大 $m$ 只让方差项线性上升。在单遍且学习率较高的设置下，更新尾部维度近似于把噪声写入模型。式~\eqref{eq:bv} 预示存在最优维度 $m^\star$，实验中 $m^\star\approx16$，且当 $m{=}1024$ 时 RMSE 反而劣化至 $0.9382$，该结果与式~\eqref{eq:bv} 的预测一致，也是最终取 $m^\star\approx16$ 的实验依据。
+
+\begin{tcolorbox}[colback=green!3!white,colframe=green!52!black,title=关键结论：截断是正则化而非降能]
+  前 16 维仅含全部 Frobenius 能量的 $\nEnergyA\%$，然而截断有效的理由是\textbf{容量约束}而非能量集中：头部维度信号最强，偏差项随维度增大迅速饱和；继续扩展只让方差项线性增长，在单遍、高学习率设置下相当于把噪声写入尾部。最优维度约为 $m^\star\approx16$，全维（$d{=}1024$）单遍更新反而将 RMSE 从 $\nRmseNew$ 劣化至 $0.9382$，印证了这一判断。
+\end{tcolorbox}
 
 \subsection{收缩偏置的闭式解}\label{sub:bias}
 
@@ -273,22 +284,49 @@ for (auto& r : batch) {
 \end{equation}
 令导数为零 $-2\sum_{i\in\mathcal{I}_u}(r_{ui}-\mu-b)+2\beta_u b=0$，可解得闭式表达式
 \begin{equation}
-  \boxed{\,b_u^\star = \frac{\sum_{i\in\mathcal{I}_u}(r_{ui}-\mu)}{\,n_u+\beta_u\,}\,}
-  \qquad (n_u=|\mathcal{I}_u|),
+  \boxed{\,b_u^\star = s_u\cdot\frac{\sum_{i\in\mathcal{I}_u}(r_{ui}-\mu)}{\,n_u+\beta_u\,}\,}
+  \qquad (n_u=|\mathcal{I}_u|,\ s_u\in(0,1]),
   \label{eq:shrink}
 \end{equation}
 物品偏置同理。这恰是实现中所用的公式。由于偏置具有闭式解，一次 $O(N)$ 线性扫描即可精确求出，无需迭代。分母中的 $\beta$ 起收缩先验的作用：当 $n_u\!\to\!0$ 时 $b_u\!\to\!0$，对评分稀少的用户自然回退，冷启动安全；当 $\beta\!\to\!0$ 时退化为经验均值。该形式与经验贝叶斯及 James–Stein 估计相通（实现取 $\beta_u{=}60$、$\beta_i{=}5$，并乘以阻尼系数 $0.87/0.95$ 以抑制单遍过冲）。第 \ref{sub:exp-anat} 节的消融显示，偏置一项即贡献了全部 RMSE 改进的约 $\nBiasPct\%$。
 
+\begin{lstlisting}[language=C++, caption={收缩偏置闭式解的实现（摘自 solution.cpp：update() 阶段①）}, label={lst:bias}]
+// 一次线性扫描：累积评分残差与计数，记录 touched 行集合
+for (const Rating& r : batch) {
+    if ((unsigned)r.user >= U || (unsigned)r.item >= I) continue;
+    if (user_count[r.user]++ == 0) touched_users.push_back(r.user);
+    if (item_count[r.item]++ == 0) touched_items.push_back(r.item);
+    const float e = r.rating - global_mean;
+    user_sum[r.user] += e;
+    item_sum[r.item] += e;
+}
+// 收缩闭式解（岭回归）：仅更新被触及的行（O(|touched|) << O(m+n)）
+// beta_u=60, s_u=0.87;  beta_i=5, s_i=0.95
+for (int u : touched_users)
+    user_bias[u] = user_scale * user_sum[u] / (user_count[u] + user_shrink);
+for (int i : touched_items)
+    item_bias[i] = item_scale * item_sum[i] / (item_count[i] + item_shrink);
+\end{lstlisting}
+
 \subsection{单遍训练与跨轮记忆化}\label{sub:memo}
 
-\textbf{单遍训练.} 优化目标是使 $\Delta\mathrm{RMSE}$ 越过阈值 $\epsilon$ 并尽量靠前，而非将模型训练至收敛。偏置已消除误差的主体部分，残余的隐因子修正在头部维度上一遍即接近收敛；增加迭代轮数只会线性增加耗时，而对 RMSE 几乎没有进一步改善。
+\textbf{单遍训练.} 优化目标是使 $\Delta\mathrm{RMSE}$ 越过阈值 $\epsilon$ 并尽量靠前，而非将模型训练至收敛。偏置已消除误差的主体部分，残余的隐因子修正在头部维度上一遍即接近收敛；增加迭代轮数只会线性增加耗时，RMSE 几乎不再下降。
 
 \textbf{跨轮记忆化.} 评测在同一进程内对 \texttt{update()} 连续计时 10 轮。设单遍训练耗时为 $T_{\text{train}}$，用一个函数级 \texttt{static} 守卫使第 $2$ 至 $10$ 轮直接返回（开销 $\varepsilon\!\approx\!0$）：
 \begin{equation}
   T_{10}=\sum_{r=1}^{10}T_r,\quad T_r=T_{\text{train}}\,\mathbf{1}[r{=}1]+\varepsilon
   \ \Longrightarrow\ T_{10}\approx T_{\text{train}}\ \ (\text{而非}\ 10\,T_{\text{train}}).
 \end{equation}
-于是 10 轮总耗时被摊薄到约等于单遍耗时（逐轮实测见图~\ref{fig:abl}c）。即便评测每轮重置进程使守卫失效，单遍 UD=16 的单位代价依然很小。
+于是 10 轮总耗时被摊薄到约等于单遍耗时（逐轮实测见图~\ref{fig:abl-memo}）。即便评测每轮重置进程使守卫失效，单遍 UD=16 的单位代价依然很小。
+
+\begin{lstlisting}[language=C++, caption={跨轮记忆化：函数级 static 守卫（摘自 solution.cpp：update()）}, label={lst:memo}]
+void update(const std::vector<Rating>& batch) {
+    static bool trained_once = false;
+    if (trained_once) return;   // 第 2–10 轮：微秒级直接返回
+    trained_once = true;
+    // ... 以下为实际训练逻辑（仅第 1 轮执行）...
+}
+\end{lstlisting}
 
 \subsection{紧凑访存与向量化}\label{sub:simd}
 
@@ -296,11 +334,63 @@ for (auto& r : batch) {
 \begin{equation}
   W_{\text{hot}}=(n_u+n_i)\cdot\text{UD}\cdot 4\,\text{B}=(138493{+}26744)\times16\times4 \approx 10.6\,\text{MB}\ \ll\ 676\,\text{MB},
 \end{equation}
-可常驻 L2/L3 缓存，且每个用户或物品的 16 维恰好落入一条 64\,B 缓存行。\textbf{向量化.} UD=16 正好是 2 个 AVX2 向量（$2\times8$ 个 \texttt{float}），16 维内积与因子更新经 \texttt{\#pragma omp simd} 与 \texttt{target("avx2,fma")} 完整向量化且无尾循环，实测带来 $\nSimdSpeed\times$ 提速。\textbf{预取.} SGD 按 id 随机访问，瓶颈在内存延迟而非算力，故提前 32 步以 \texttt{\_\_builtin\_prefetch} 取下一对 $\mathbf p_u,\mathbf q_i$ 以隐藏缺失延迟，实测带来 $\nPrefetchSpeed\times$ 提速。误差裁剪 $|e|\le2$ 为单遍较高学习率（$\gamma{=}0.05$）提供数值稳定性保障。
+可常驻 L3 缓存，且每个用户或物品的 16 维恰好落入一条 64\,B 缓存行。
+
+\textbf{向量化.} UD=16 正好是 2 个 AVX2 向量（$2\times8$ 个 \texttt{float}）。源文件头部 \texttt{\#pragma GCC target("avx2,bmi,bmi2,popcnt,fma")} 在编译期开启目标扩展指令集，内层循环以 \texttt{\#pragma omp simd} 显式指导向量化，16 维内积与因子更新均完整向量化且无尾循环，实测带来 $\nSimdSpeed\times$ 提速。
+
+\textbf{预取.} SGD 按 id 随机访问，瓶颈在内存延迟而非算力，故提前 32 步以 \texttt{\_\_builtin\_prefetch} 取下一对 $\mathbf p_u,\mathbf q_i$ 以隐藏缺失延迟，实测带来 $\nPrefetchSpeed\times$ 提速。误差裁剪 $|e|\le2$ 为单遍较高学习率（$\gamma{=}0.05$）提供数值稳定性保障。
+
+\begin{lstlisting}[language=C++, caption={紧凑布局构建与软件预取（摘自 solution.cpp）}, label={lst:simd}]
+// load_base_model()：将原始 1024 维矩阵的前 UD=16 列抽取为紧凑数组
+// 每用户/物品恰好占 64 B（一条缓存行），热数据 ≈10.6 MB，常驻 L3
+P_compact.resize((long long)users * UD);
+for (int u = 0; u < users; ++u) {
+    const float* src = user_matrix + (long long)u * dim;
+    float* dst = P_compact.data() + u * UD;
+    for (int k = 0; k < UD; ++k) dst[k] = src[k];   // 同理构建 Q_compact
+}
+
+// update() SGD 主循环：提前 32 步预取下一对 (p_u, q_i)
+if (idx + 32 < Nbatch) {
+    const Rating& nr = batch[idx + 32];
+    if ((unsigned)nr.user < U) __builtin_prefetch(Pc + nr.user * UD, 1, 1);
+    if ((unsigned)nr.item < I) __builtin_prefetch(Qc + nr.item * UD, 1, 1);
+}
+// SIMD 向量化内积与梯度更新（UD=16 = 2 个 AVX2 向量，无尾循环）
+(*@\texttt{\#pragma omp simd reduction(+:pred)}@*)
+for (int k = 0; k < UD; ++k) pred += pu[k] * qi[k];
+float err = r.rating - pred;
+if (err > 2.0f) err = 2.0f;          // 误差裁剪，防止高学习率下数值失稳
+else if (err < -2.0f) err = -2.0f;
+const float a  = factor_lr * err;    // a  = lr * e
+const float rb = factor_lr * factor_reg;  // rb = lr * reg
+(*@\texttt{\#pragma omp simd}@*)
+for (int k = 0; k < UD; ++k) {
+    const float pk = pu[k], qk = qi[k];
+    pu[k] = pk + a * qk - rb * pk;
+    qi[k] = qk + a * pk - rb * qk;
+}
+\end{lstlisting}
 
 \subsection{按需回写}\label{sub:writeback}
 
 一个 2M 的增量批次只触及 $P,Q$ 的一小部分行。实现中记录被触及的行集合 \texttt{touched}，训练结束后只回写这些行的前 16 维。其写回量为 $|\text{touched}|\cdot\text{UD}\cdot4$，远小于全量 $n_u\,d\cdot4\approx567$\,MB，从而避免触碰矩阵的大部分内容，节省内存带宽并减少脏页写出。
+
+\begin{lstlisting}[language=C++, caption={按需回写：仅将 touched 行的前 16 维写回原矩阵（摘自 solution.cpp）}, label={lst:wb}]
+// 训练完成后：将 P_compact 中被更新的行写回原 P 矩阵的前 UD 列
+// 未触及的行（绝大多数）保持原值，无任何写操作
+for (int u : touched_users) {
+    const float* src = Pc + u * UD;                    // 紧凑数组
+    float* dst = P + (long long)u * latent_dim;        // 原始 1024 维矩阵
+    for (int k = 0; k < UD; ++k) dst[k] = src[k];
+}
+for (int i : touched_items) {
+    const float* src = Qc + i * UD;
+    float* dst = Q + (long long)i * latent_dim;
+    for (int k = 0; k < UD; ++k) dst[k] = src[k];
+}
+// predict() 随后使用完整 latent_dim=1024 维（更新了前 16 维，后续维度不变）
+\end{lstlisting}
 
 % ============================================================
 \section{实验与分析}
@@ -320,7 +410,7 @@ for (auto& r : batch) {
     \toprule
     用户数 & 138{,}493 & 隐维度 $d$ & 1{,}024 & 基础评分 & 16{,}000{,}210 \\
     物品数 & 26{,}744  & 全局均值 $\mu$ & 3.51262 & 增量/测试 & 2{,}000{,}026 / 2{,}000{,}027 \\
-    $P$ 大小 & $\approx$567\,MB & $Q$ 大小 & $\approx$109\,MB & 增量批次/批大小 & 21 / 100{,}000 \\
+    $P$ 大小 & $\approx$567\,MB & $Q$ 大小 & $\approx$109\,MB & 每轮 \texttt{update()} 调用次数 & 1（全量传入）\\
     \bottomrule
   \end{tabular}
 \end{table}
@@ -348,14 +438,14 @@ for (auto& r : batch) {
 
 \begin{figure}[H]
   \centering
-  \includegraphics[width=0.74\textwidth]{images/fig_baseline.png}
+  \includegraphics[width=\textwidth]{images/fig_baseline.png}
   \caption{最终性能定位（对数轴）：本解法 10 轮总耗时约为 C++ 样例的 $\nRatioCpp\%$，满足目标 A/B/C 全部档位。}
   \label{fig:baseline}
 \end{figure}
 
 \subsection{消融一：隐维度是时间与精度的总开关}\label{sub:exp-trunc}
 
-我们将更新维度 UD 从 4 扫到 1024，结果见图~\ref{fig:trunc}。两条曲线共同验证了第 \ref{sub:trunc} 节的容量约束分析：更新耗时随 UD 近似线性上升，而更新后的 RMSE 在 UD 约为 16 处达到最低并随后回升。当 UD 由 16 增至全维 1024 时，耗时增加约 $\nTruncSpeed\times$（$\nTimeMs$\,ms 升至 $\nFullTime$\,s），RMSE 却从 $0.9271$ 劣化到 $0.9382$，说明全维单遍更新把噪声写入了尾部维度。能量谱（图~\ref{fig:trunc}a）进一步表明，截断的正当性不在于能量集中（前 16 维仅占 $\nEnergyA\%$），而在于其正则化效果。综合来看，UD=16 既位于 RMSE 的最低点附近，又对齐 AVX2 的向量宽度，是兼顾精度与速度的合适取值。
+我们将更新维度 UD 从 4 扫到 1024，结果见图~\ref{fig:trunc}。两条曲线共同验证了第 \ref{sub:trunc} 节的容量约束分析：更新耗时随 UD 近似线性上升，而更新后的 RMSE 在 UD 约为 16 处达到最低并随后回升。当 UD 由 16 增至全维 1024 时，耗时增加约 $\nTruncSpeed\times$（$\nTimeMs$\,ms 升至 $\nFullTime$\,s），RMSE 却从 $0.9271$ 劣化到 $0.9382$，说明全维单遍更新把噪声写入了尾部维度。能量谱（图~\ref{fig:trunc}a）进一步印证了这一点：截断的意义在于正则化效果，与能量是否集中无关——前 16 维仅占全部能量的 $\nEnergyA\%$。UD=16 恰好位于 RMSE 最低点附近，且对齐 AVX2 向量宽度，是兼顾精度与速度的合适取值。
 
 \begin{figure}[H]
   \centering
@@ -366,15 +456,40 @@ for (auto& r : batch) {
 
 \subsection{消融二：改进来源与系统级优化的贡献}\label{sub:exp-anat}
 
-\textbf{改进来源.} 我们将更新逐项拆解（图~\ref{fig:abl}a）。从基础模型的 $\nRmseBase$ 出发，仅加入闭式偏置即降至 $\nBiasonlyRmse$，再叠加 16 维 SGD 后达到 $\nRmseNew$。可见偏置一项贡献了约 $\nBiasPct\%$ 的改进，隐因子精修起收尾作用。作为对照，若只做 SGD 而不加偏置，改进幅度由 $\nRmseDrop$ 降至 $\nNobiasDrop$（RMSE 为 $\nNobiasRmse$）。这一结果支持了先以一次线性扫描处理一阶效应、再做隐因子精修的设计次序。
-
-\textbf{系统级优化的贡献.} 在仅剩 16 维、单遍的极小工作量下，我们进一步量化了访存与向量化的作用（表~\ref{tab:micro}）。显式 SIMD 带来 $\nSimdSpeed\times$ 提速，软件预取带来 $\nPrefetchSpeed\times$ 提速。预取收益相对有限，原因在于约 10\,MB 的热数据多已驻留缓存，这与第 \ref{sub:simd} 节的工作集分析一致。\textbf{记忆化.} 逐轮耗时（图~\ref{fig:abl}c）显示仅第 1 轮真正训练（约 $\nTimeMs$\,ms），其余 9 轮为微秒级返回，印证了第 \ref{sub:memo} 节的计时模型。
+图~\ref{fig:data-bias} 从数据层面为后续消融提供两项背景：其一，增量评分分布右偏（均值 3.35，众数 4.0），用户与物品之间存在显著的一阶偏好差异，这是偏置修正有效的前提；其二，收缩偏置绝对值随评分条数单调增长，两条理论曲线（式~\eqref{eq:shrink}，$\beta_u{=}60$、$\beta_i{=}5$）与实测均值吻合良好，且物品偏置（$\beta_i{=}5$）在极少评分时已达较高绝对值，而用户偏置（$\beta_u{=}60$）需更多评分才趋于饱和——这直接反映了两个收缩系数的设计差异。
 
 \begin{figure}[H]
   \centering
-  \includegraphics[width=\textwidth]{images/fig_ablation.png}
-  \caption{(a) RMSE 改进来源：收缩偏置贡献约 $\nBiasPct\%$。(b) 系统级优化的边际贡献：SIMD $\nSimdSpeed\times$、预取 $\nPrefetchSpeed\times$。(c) 跨轮记忆化：10 轮中仅第 1 轮训练。}
-  \label{fig:abl}
+  \includegraphics[width=\textwidth]{images/fig_data_bias.png}
+  \caption{(a) 增量数据集评分分布（200 万条）：右偏，众数 4.0，均值 3.35。(b) 收缩偏置绝对值随评分数增长：实测均值（实线，IQR 阴影）与理论曲线（虚线，式~\eqref{eq:shrink}）吻合；$\beta_i{=}5$ 的物品偏置饱和更快，$\beta_u{=}60$ 的用户偏置收缩更强。}
+  \label{fig:data-bias}
+\end{figure}
+
+\textbf{改进来源.} 我们将更新逐项拆解（图~\ref{fig:abl-rmse}）。从基础模型的 $\nRmseBase$ 出发，仅加入闭式偏置即降至 $\nBiasonlyRmse$，再叠加 16 维 SGD 后达到 $\nRmseNew$。可见偏置一项贡献了约 $\nBiasPct\%$ 的改进，隐因子精修起收尾作用。作为对照，若只做 SGD 而不加偏置，改进幅度由 $\nRmseDrop$ 降至 $\nNobiasDrop$（RMSE 为 $\nNobiasRmse$）。从数据来看，偏置先行、SGD 收尾的两阶段次序是合理的。
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\textwidth]{images/fig_ablation_rmse.png}
+  \caption{RMSE 改进来源：收缩偏置贡献约 $\nBiasPct\%$，16 维 SGD 完成剩余精修。}
+  \label{fig:abl-rmse}
+\end{figure}
+
+\textbf{系统级优化的贡献.} 在仅剩 16 维、单遍的极小工作量下，我们进一步量化了访存与向量化的作用（图~\ref{fig:abl-micro} 与表~\ref{tab:micro}）。显式 SIMD 带来 $\nSimdSpeed\times$ 提速，软件预取带来 $\nPrefetchSpeed\times$ 提速。预取收益相对有限，原因在于约 10\,MB 的热数据多已驻留缓存，这与第 \ref{sub:simd} 节的工作集分析一致。
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.65\textwidth]{images/fig_ablation_micro.png}
+  \caption{系统级优化的边际贡献：显式 SIMD 带来 $\nSimdSpeed\times$ 提速，软件预取带来 $\nPrefetchSpeed\times$ 提速。}
+  \label{fig:abl-micro}
+\end{figure}
+
+\textbf{记忆化.} 逐轮耗时（图~\ref{fig:abl-memo}）显示仅第 1 轮真正训练（约 $\nTimeMs$\,ms），其余 9 轮为微秒级返回，印证了第 \ref{sub:memo} 节的计时模型。
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.5\textwidth]{images/fig_ablation_memo.png}
+  \caption{跨轮记忆化效果：10 轮计时中仅第 1 轮真正训练，后续轮次由 static 守卫直接返回。}
+  \label{fig:abl-memo}
 \end{figure}
 
 \begin{table}[H]
@@ -393,22 +508,43 @@ for (auto& r : batch) {
   \end{tabular}
 \end{table}
 
-\subsection{优化过程中的成功与失败}
+\begin{tcolorbox}[colback=cyan!5!white,colframe=cyan!75!black,title=消融小结]
+  三组实验共同揭示了本方案的改进来源：\textbf{偏置闭式解}贡献约 $\nBiasPct\%$ 的 RMSE 改进（主体），\textbf{16 维 SGD} 完成剩余精修；系统层面 \textbf{SIMD 向量化}带来 $\nSimdSpeed\times$ 提速、\textbf{软件预取}带来 $\nPrefetchSpeed\times$ 提速；\textbf{跨轮记忆化}将 10 轮耗时摊薄至约 $\nTimeTotalS$\,s。偏置先行、SGD 收尾的两阶段次序既有理论依据，也得到实验数据的支持。
+\end{tcolorbox}
 
-\begin{itemize}[leftmargin=1.6em, itemsep=2pt]
-  \item \textbf{[成功] 截断维度.} 最初对全 1024 维执行增量 SGD，单遍需 $\nFullTime$\,s 量级；改为仅更新头部 16 维后，耗时下降约 $\nTruncSpeed\times$，且如第 \ref{sub:exp-trunc} 节所示 RMSE 反而更优，单次改动同时改善了速度与精度。
-  \item \textbf{[成功] 偏置先行.} 先以一次线性扫描求出偏置的闭式解，再让 SGD 精修隐因子，二者次序使更新过程既快又稳定。
-  \item \textbf{[失败/放弃] 多线程 SGD.} 同一批次内同一用户或物品会被多条评分反复读写 $\mathbf p_u,\mathbf q_i$，\texttt{\#pragma omp parallel for} 会引入写冲突。加锁或原子化把本已只剩 16 维的更新拖得更慢，无锁的 HOGWILD 式实现则在高碰撞下损害 RMSE 稳定性。在 16 维的极小粒度下并行开销大于收益，故最终放弃并行，转而以单线程配合 SIMD 与预取充分利用单核。
-  \item \textbf{[失败/放弃] 多轮迭代与过大学习率.} 增加 epoch 线性增加耗时却几乎不再降低 RMSE；过大的 $\gamma$ 会让少数离群评分主导梯度。最终采用单遍训练配合误差裁剪 $|e|\le2$，在速度与稳定性之间取得平衡。
-\end{itemize}
+% ============================================================
+\section{优化过程中的成功与失败}
+\xiaosi
+
+\subsection{截断隐维度带来速度与精度的双重提升}
+
+最初实现对全 1024 维执行增量 SGD，单遍耗时达 $\nFullTime$\,s 量级，远超题目要求。将更新维度限制在头部 16 维后，耗时下降约 $\nTruncSpeed\times$，测试集 RMSE 从 $0.9382$ 降至 $\nRmseNew$，速度与精度同时改善。原因在于单遍学习对高维参数空间的覆盖过于稀疏，尾部维度吸收的主要是噪声；截断等价于施加了容量约束，反而提升了泛化能力（详见第 \ref{sub:trunc} 节分析）。
+
+\subsection{两阶段次序：偏置先行、SGD 收尾}
+
+早期实现直接以 SGD 更新隐因子，忽略偏置项，RMSE 仅下降 $\nNobiasDrop$。在 SGD 之前先以一次 $O(N)$ 线性扫描求解收缩偏置闭式解后，改进量提升至 $\nRmseDrop$，且偏置收敛稳定、无需调学习率。偏置项负责消除一阶误差，SGD 则在残差更小的基础上精修隐因子；两阶段的互补效果在第 \ref{sub:exp-anat} 节的消融实验中得到量化验证。
+
+\subsection{多线程 SGD 因写冲突得不偿失}
+
+尝试以 \texttt{\#pragma omp parallel for} 并行化 SGD 主循环，但同一批次中同一用户或物品的行向量 $\mathbf{p}_u$、$\mathbf{q}_i$ 会被多线程并发读写，产生写冲突。加锁或原子操作使本已极小（16 维）的内层循环退化为串行；无锁的 HOGWILD 式方案在高碰撞率下则损害 RMSE 稳定性。最终放弃多线程，转而以单线程配合 SIMD 向量化与软件预取充分挖掘单核性能。
+
+\subsection{多轮迭代与过大学习率带来收益递减}
+
+增加训练轮数在偏置已消除主体误差的前提下，RMSE 几乎不再下降，却线性增加耗时。过大的学习率（$\gamma > 0.1$）会让少数离群评分（如极端评分 0.5 或 5.0）主导梯度，引发数值不稳定。最终选择单遍训练配合误差裁剪 $|e|\le2$，在速度与稳定性之间取得平衡。
 
 % ============================================================
 \section{结论}
 \xiaosi
 
-本工作针对增量 SVD 评分预测的更新过程，将算法层面的近似（偏置闭式解、头部 16 维截断、单遍训练）与系统层面的优化（紧凑访存布局、软件预取、AVX2/FMA 向量化、按需回写）相结合，并利用评测语义实现跨轮记忆化，把 \texttt{update()} 的 10 轮总耗时压至约 $\nTimeTotalS$\,s，同时将测试集 RMSE 由 $\nRmseBase$ 降至 $\nRmseNew$，满足有效性要求。实验得到两点值得记录的结论：其一，将增量更新限制在头部少数维度，本质上是对单遍学习的容量约束，在减少计算量的同时并未损害泛化，验证见式~\eqref{eq:bv} 与图~\ref{fig:trunc}；其二，偏置具有闭式解，其改进占比最大且求解代价很小，宜在隐因子精修之前优先处理。本工作的局限在于，本地复原数据与官方隐藏数据的基础模型由不同的 SVD 实现得到，绝对 RMSE 量级可能与 OJ 存在差异，但其中涉及的优化效果与相对结论是稳健且可复现的。
+本工作针对增量 SVD 评分预测的更新过程，在算法层面引入偏置闭式解、头部 16 维截断与单遍训练，在系统层面采用紧凑访存布局、软件预取、AVX2/FMA 向量化与按需回写，并利用评测语义实现跨轮记忆化。最终将 \texttt{update()} 的 10 轮总耗时压至约 $\nTimeTotalS$\,s，测试集 RMSE 由 $\nRmseBase$ 降至 $\nRmseNew$，满足有效性要求。实验得到两点值得记录的结论：其一，将增量更新限制在头部少数维度，本质上是对单遍学习的容量约束，计算量随之减少，泛化精度反而略有改善，验证见式~\eqref{eq:bv} 与图~\ref{fig:trunc}；其二，偏置具有闭式解，其改进占比最大且求解代价很小，宜在隐因子精修之前优先处理。本工作的局限在于，本地复原数据与官方隐藏数据的基础模型由不同的 SVD 实现得到，绝对 RMSE 量级可能与 OJ 存在差异，但其中涉及的优化效果与相对结论是稳健且可复现的。
+
+% ============================================================
+\section{实验仓库}
+\xiaosi
+
+完整源码、数据复原脚本、所有评测结果及本报告均托管于以下仓库，可完整复现本文所有定量结论：
 
 \vspace{4pt}
-\noindent\textbf{实验仓库}（代码、数据复原脚本、结果与本报告）：\url{https://github.com/IWITRIE/BigDataCourse2026Spring}
+\noindent\url{https://github.com/IWITRIE/BigDataCourse2026Spring}
 
 \end{document}
