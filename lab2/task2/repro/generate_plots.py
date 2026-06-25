@@ -236,7 +236,7 @@ def fig_truncation():
 
     # Annotation in upper-right empty area — arrow points diagonally to UD=16 dot
     ax.annotate(
-        f"UD=16 最优\n{t[2]:.0f} ms · RMSE {rmse[2]:.5f}",
+        f"UD=16 权衡选取\n{t[2]:.0f} ms · RMSE {rmse[2]:.5f}",
         xy=(2, t[2]),                  # UD=16 data point
         xytext=(5.0, t[-1] * 2.0),    # upper-right clear area (above curves)
         fontsize=8.5, color=C["green"], fontweight="bold",
@@ -256,8 +256,8 @@ def fig_truncation():
 # ══════════════════════════════════════════════════════════════════════════════
 def fig_ablation():
     fig = plt.figure(figsize=(16.0, 4.6))
-    gs  = fig.add_gridspec(1, 3, wspace=0.52,
-                            left=0.052, right=0.975, top=0.92, bottom=0.20,
+    gs  = fig.add_gridspec(1, 3, wspace=0.22,
+                            left=0.040, right=0.988, top=0.92, bottom=0.20,
                             width_ratios=[0.90, 1.30, 0.82])
 
     base      = results["ud16"]["rmse_base"]
@@ -399,14 +399,13 @@ def fig_ablation():
 #  FIG 3 — Baseline positioning
 # ══════════════════════════════════════════════════════════════════════════════
 def fig_baseline():
-    T16   = micro["final"]["median_ms"]
-    total = T16 / 1000.0
+    total = results["final"]["time_total"]   # 10 轮总耗时 (runner 直测)
 
     items = [
         ("C++ 参考样例",           54.0,  C["grey"]),
         ("目标 B（½ 参考样例）",    27.0,  C["purple"]),
         ("目标 C（10% 参考样例）",   5.4,  C["orange"]),
-        ("本解法（单遍 median）",   total, C["green"]),
+        ("本解法（10 轮总耗时）",   total, C["green"]),
     ]
 
     fig, ax = plt.subplots(figsize=(9.4, 4.0))
