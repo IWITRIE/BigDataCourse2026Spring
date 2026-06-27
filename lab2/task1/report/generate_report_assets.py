@@ -211,7 +211,7 @@ def fig_dataset_overview(ratings):
               f"Total:  {len(scores):,}\n"
               f"Mean:   {scores.mean():.1f}\n"
               f"Std:    {scores.std():.1f}\n"
-              f"Mode:   100",
+              f"Mode:    80",
               loc="upper left")
 
     # ── Panel B: user activity (log x-axis reveals long tail) ─────────────────
@@ -669,7 +669,7 @@ def fig_prediction_distribution(ratings, preds):
               f"N:      {len(true_scores):,}\n"
               f"Mean:  {true_scores.mean():.1f}\n"
               f"Std:    {true_scores.std():.1f}\n"
-              f"Mode:  100",
+              f"Mode:   80",
               loc="upper right")
     _tag(ax, "A")
 
